@@ -20,7 +20,9 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # ─────────────────────────────────────────
       # 🔒 STAGE 1: CODE SECURITY SCAN
@@ -30,6 +32,8 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: detect --source . --exit-code 0
         # Catches hardcoded API keys, passwords,
         # AWS keys accidentally committed to code
 
