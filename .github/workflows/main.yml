@@ -1,0 +1,170 @@
+name: Deploy to Amazon ECS
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+  CONTAINER_NAME: ${{ secrets.CONTAINER_NAME }}
+  TASK_DEFINITION: ${{ secrets.TASK_DEFINITION }}
+
+jobs:
+  deploy:
+    name: Build, Scan and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # ─────────────────────────────────────────
+      # 🔒 STAGE 1: CODE SECURITY SCAN
+      # ─────────────────────────────────────────
+
+      - name: Scan code for secrets (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Catches hardcoded API keys, passwords,
+        # AWS keys accidentally committed to code
+
+      - name: Scan Dockerfile for misconfigurations (Checkov)
+        uses: bridgecrewio/checkov-action@master
+        with:
+          file: Dockerfile
+          framework: dockerfile
+          soft_fail: true       # ← warn only, don't block
+        # Catches Dockerfile bad practices
+
+      # ─────────────────────────────────────────
+      # ☁ STAGE 2: AWS SETUP
+      # ─────────────────────────────────────────
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      # ─────────────────────────────────────────
+      # 🐳 STAGE 3: BUILD
+      # ─────────────────────────────────────────
+
+      - name: Build Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      # ─────────────────────────────────────────
+      # 🔍 STAGE 4: IMAGE VULNERABILITY SCAN
+      # ─────────────────────────────────────────
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+        # Pipeline STOPS here if CRITICAL or HIGH
+        # vulnerabilities found with available fixes
+
+      - name: Upload Trivy scan report
+        uses: actions/upload-artifact@v3
+        if: always()            # ← upload report even if scan fails
+        with:
+          name: trivy-report
+          path: trivy-results.txt
+
+      - name: Show Trivy Report
+        if: always()
+        run: |
+         cat trivy-results.txt
+
+      # ─────────────────────────────────────────
+      # 📤 STAGE 5: PUSH TO ECR
+      # ─────────────────────────────────────────
+
+      - name: Push image to ECR
+        id: push-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Check ECR built-in scan results
+        run: |
+          echo "Waiting for ECR scan..."
+          sleep 30
+          aws ecr describe-image-scan-findings \
+            --repository-name $ECR_REPOSITORY \
+            --image-id imageTag=${{ github.sha }} \
+            --region $AWS_REGION \
+            --query 'imageScanFindings.findingSeverityCounts'
+
+      # ─────────────────────────────────────────
+      # 🚀 STAGE 6: DEPLOY TO ECS
+      # ─────────────────────────────────────────
+
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ secrets.TASK_DEFINITION }} \
+            --query taskDefinition > task-definition.json
+
+      - name: Clean task definition
+        run: |
+          jq 'del(
+            .taskDefinitionArn,
+            .revision,
+            .status,
+            .requiresAttributes,
+            .compatibilities,
+            .registeredAt,
+            .registeredBy,
+            .enableFaultInjection,
+            .tags
+          )' task-definition.json > cleaned-task-definition.json
+          mv cleaned-task-definition.json task-definition.json
+
+      - name: Update ECS task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ secrets.CONTAINER_NAME }}
+          image: ${{ steps.push-image.outputs.image }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ secrets.ECS_SERVICE }}
+          cluster: ${{ secrets.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          wait-timeout: 300
+
+      - name: Deploy successful
+        run: |
+          echo "🚀 Deployment complete!"
+          echo "Image: ${{ steps.push-image.outputs.image }}"
+          echo "Cluster: ${{ secrets.ECS_CLUSTER }}"
+          echo "Service: ${{ secrets.ECS_SERVICE }}"
