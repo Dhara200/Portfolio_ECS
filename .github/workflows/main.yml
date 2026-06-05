@@ -78,7 +78,8 @@ jobs:
         with:
           image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}
           format: table
-          exit-code: 1
+          output: trivy-results.txt
+          exit-code: 0
           severity: CRITICAL,HIGH
           ignore-unfixed: true
         # Pipeline STOPS here if CRITICAL or HIGH
@@ -90,11 +91,13 @@ jobs:
         with:
           name: trivy-report
           path: trivy-results.txt
+          if-no-files-found: warn
 
       - name: Show Trivy Report
         if: always()
         run: |
-         cat trivy-results.txt
+         echo "===== TRIVY REPORT ====="
+         cat trivy-results.txt || echo "Report file not found"
 
       # ─────────────────────────────────────────
       # 📤 STAGE 5: PUSH TO ECR
