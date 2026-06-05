@@ -85,7 +85,7 @@ jobs:
         # vulnerabilities found with available fixes
 
       - name: Upload Trivy scan report
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: always()            # ← upload report even if scan fails
         with:
           name: trivy-report
